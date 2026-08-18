@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Part I: How Debuggers Work (and Why They Break)</title>
+  <meta name="description" content="&quot;The process is stuck. GDB won't attach. kill -9 won't kill it. Now what?&quot;">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="index.html" class="logo"><span>dcoredumper</span></a>
+    <nav class="site-nav">
+      <a href="part1.html" class="active">I</a>
+      <a href="part2.html">II</a>
+      <a href="part3.html">III</a>
+      <a href="part4.html">IV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="article">
+  <div class="container">
+
+    <div class="article-meta">
+      <div class="part-label">Part I</div>
+      <h1>How Debuggers Work (and Why They Break)</h1>
+      <p class="article-subtitle">"The process is stuck. GDB won't attach. kill -9 won't kill it. Now what?"</p>
+    </div>
+
+    <p>If you&#39;ve ever had a process freeze so hard that even <code>kill -9</code> couldn&#39;t save you, you&#39;ve probably encountered a <strong>D-state process</strong>. And if you&#39;ve tried to debug one, you&#39;ve discovered something uncomfortable: the tools we rely on — GDB, <code>gcore</code>, <code>strace</code> — all silently fail.</p>
+<p>This is the story of how we built a tool to debug the un-debuggable. But before we get there, we need to understand <em>why</em> debuggers break in the first place.</p>
+<h2>The ptrace Contract</h2>
+<p>Every debugger on Linux — GDB, lldb, strace, even <code>gcore</code> — relies on a single system call to do its job: <strong><code>ptrace()</code></strong>.</p>
+<p>Here&#39;s the simplified version of what happens when you type <code>gdb -p 1234</code>:</p>
+<pre><code class="language-">1. GDB calls ptrace(PTRACE_ATTACH, 1234, ...)
+2. The kernel sends SIGSTOP to PID 1234
+3. PID 1234 receives the signal, stops executing, enters state 'T' (traced)
+4. GDB calls waitpid() — the kernel says "yes, 1234 has stopped"
+5. Now GDB can read registers, memory, set breakpoints — full control</code></pre><p>This is a <strong>cooperative protocol</strong>. GDB asks the kernel to stop the process, the kernel delivers a signal, and the process acknowledges it by actually stopping. Only then does GDB get access.</p>
+<p>Think of it like a phone call. GDB dials the process, the process picks up, and now they can talk. The entire debugging model assumes that the other side will pick up the phone.</p>
+<p><img src="images/ptrace_handshake.png" alt="" loading="lazy">
+<p class="img-caption"></p></p>
+<p>But what if the process <em>can&#39;t</em> pick up?</p>
+<h2>What is D-State?</h2>
+<p>Linux tracks every process in one of several states. You&#39;ve seen them in <code>ps</code> or <code>top</code>:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Letter</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Running</td>
+<td><code>R</code></td>
+<td>Currently executing or ready to run</td>
+</tr>
+<tr>
+<td>Sleeping</td>
+<td><code>S</code></td>
+<td>Waiting for something (interruptible)</td>
+</tr>
+<tr>
+<td><strong>Disk Sleep</strong></td>
+<td><strong><code>D</code></strong></td>
+<td><strong>Waiting for I/O (uninterruptible)</strong></td>
+</tr>
+<tr>
+<td>Zombie</td>
+<td><code>Z</code></td>
+<td>Finished but parent hasn&#39;t collected exit status</td>
+</tr>
+<tr>
+<td>Stopped</td>
+<td><code>T</code></td>
+<td>Paused by a signal or debugger</td>
+</tr>
+</tbody></table>
+<p>The <code>S</code> state (interruptible sleep) is the normal &quot;waiting&quot; state. When your program calls <code>read()</code> on a network socket, it goes to sleep in <code>S</code> state. If a signal arrives — like <code>SIGSTOP</code> from GDB — the kernel wakes it up to handle the signal. No problem.</p>
+<p><code>D</code> state is different. <code>D</code> stands for <strong>&quot;Disk sleep&quot;</strong> or, more precisely, <code>TASK_UNINTERRUPTIBLE</code>. When a process is in D-state, the kernel has made a deliberate decision: <strong>this process will not be woken up by signals</strong>. Period. Not <code>SIGSTOP</code>. Not <code>SIGKILL</code>. Not anything.</p>
+<h3>Why would the kernel do this?</h3>
+<p>Because some operations <strong>cannot be safely interrupted</strong>.</p>
+<p>Imagine a process is in the middle of writing metadata to a filesystem. The on-disk data structure is half-updated. If the kernel let a signal interrupt this operation, the filesystem could be left in a corrupted state. So the kernel says: &quot;No. This thread stays asleep until the I/O completes. Nothing else matters.&quot;</p>
+<p>This is a reasonable design for operations that take microseconds — a disk write, a page fault, an NFS lookup. The process goes into D-state, the I/O completes almost instantly, and it comes back. You&#39;d never even notice.</p>
+<p>The problem is when the I/O <strong>never completes</strong>.</p>
+
+<h2>The Debugger&#39;s Blind Spot</h2>
+<p>Let&#39;s try it. Here&#39;s the real setup — a Vagrant VM running Arch Linux with CVMFS mounted. We run <code>tree</code> on a CVMFS path, which triggers a D-state:</p>
+<pre><code class="language-bash">vagrant@arch D-state-debugger]$ ps aux | grep D
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+vagrant     1344  0.0  0.0   5980  4228 pts/1    D+   17:36   0:00 tree /cvmfs/alice.cern.ch</code></pre><p>There&#39;s the <code>D</code>. The <code>tree</code> process is stuck waiting on a CVMFS FUSE lookup that never returns. Let&#39;s try attaching GDB:</p>
+<pre><code class="language-bash">$ sudo gdb -p 1344
+Attaching to process 1344...</code></pre><p>And... nothing. GDB hangs. Forever.</p>
+<p>Here&#39;s what&#39;s happening under the hood:</p>
+<pre><code class="language-">1. GDB calls ptrace(PTRACE_ATTACH, 1234)
+2. The kernel marks 1234 as "being traced" — this part succeeds
+3. The kernel tries to deliver SIGSTOP to 1234
+4. But 1234 is in TASK_UNINTERRUPTIBLE — signals are not delivered
+5. GDB calls waitpid(1234) expecting to hear "process has stopped"
+6. waitpid() blocks forever because the process will never stop
+7. Now GDB itself is stuck</code></pre><p>Let&#39;s try <code>gcore</code> (generates a core dump from a live process):</p>
+<pre><code class="language-bash">$ sudo gcore 1344
+# ... hangs forever (uses ptrace internally)</code></pre><p>How about <code>kill -9</code>?</p>
+<pre><code class="language-bash">$ sudo kill -9 1344
+# Nothing happens. The process is still there.
+$ ps aux | grep D
+vagrant     1344  0.0  0.0   5980  4228 pts/1    D+   17:36   0:00 tree /cvmfs/alice.cern.ch</code></pre><p>Even <code>SIGKILL</code> — the so-called &quot;unblockable&quot; signal — doesn&#39;t work. The kernel queues the signal, but D-state means &quot;don&#39;t deliver signals,&quot; so SIGKILL just sits in the pending queue forever. The process will only die when (if) the I/O operation it&#39;s waiting on eventually completes or times out. In our CVMFS case, that never happens.</p>
+<p>We&#39;re completely blind. The process is stuck, we can&#39;t debug it, we can&#39;t kill it, and we have no idea <em>where</em> in the code it&#39;s stuck. The only diagnostic we have is the letter <code>D</code> in the <code>ps</code> output.</p>
+<p>Or so we thought.</p>
+<h2>The /proc Backdoor</h2>
+<p>Here&#39;s the key insight that makes everything else possible: <strong><code>/proc/&lt;pid&gt;/</code> still works for D-state processes.</strong></p>
+<p>Why? Because <code>ptrace</code> and <code>/proc</code> take completely different paths through the kernel:</p>
+<div class="compare">
+  <div>
+    <div class="heading fail">ptrace path — FAILS</div>
+GDB calls ptrace(PTRACE_ATTACH)
+  |
+Kernel sends SIGSTOP to PID
+  |
+Process must handle the signal
+  |
+D-state: cannot handle signals
+  |
+waitpid() blocks forever
+  |
+[GDB itself is now stuck]</div>
+  <div>
+    <div class="heading ok">/proc path — WORKS</div>
+Our tool calls open()
+  |
+/proc/1344/maps
+  |
+Kernel reads its own
+internal data structures
+  |
+Returns data immediately
+  |
+[Works on any state]</div>
+</div><p>The <code>/proc</code> filesystem is not a real filesystem. It&#39;s a virtual interface maintained by the kernel that exposes process internals as readable files. And critically, reading from <code>/proc/&lt;pid&gt;/maps</code> or <code>/proc/&lt;pid&gt;/mem</code> does <strong>not</strong> use the ptrace mechanism. It doesn&#39;t send signals. It doesn&#39;t need the process to cooperate. The kernel simply reads its own internal data structures and presents them to you.</p>
+<pre><code class="language-bash"># This works even when the process is in D-state:
+# (using PID 1344 from our actual test run)
+$ cat /proc/1344/maps          # Memory map (all loaded libraries)
+$ cat /proc/1344/task/1344/syscall   # Current syscall + RSP + RIP registers
+$ xxd /proc/1344/mem            # Raw process memory (with pread)
+$ cat /proc/1344/auxv           # Auxiliary vector</code></pre><p>We have everything:</p>
+<ul>
+<li><strong>Memory layout</strong> — every loaded library, every heap/stack region</li>
+<li><strong>CPU registers</strong> — at least RSP (stack pointer) and RIP (instruction pointer) for every thread</li>
+<li><strong>Raw memory</strong> — the actual bytes of the process&#39;s address space</li>
+<li><strong>Thread list</strong> — every thread via <code>/proc/&lt;pid&gt;/task/</code></li>
+</ul>
+<p>That&#39;s all the ingredients of a core dump. We just need to assemble them into an ELF file that GDB can read.</p>
+<p>And that&#39;s exactly what we built. A tool that constructs a valid ELF core dump from a D-state process by reading <code>/proc</code> directly — no ptrace, no signals, no cooperation needed.</p>
+<p>In Part 2, we&#39;ll dive into the ELF core dump format itself — what&#39;s actually inside a core file, byte by byte, and why each piece matters for GDB to give us a backtrace.</p>
+
+
+    <div class="article-nav"><div></div><a href="part2.html" class="next"><span class="dir">Next →</span><span class="title">Part 2: The ELF Core Dump</span></a></div>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container"><p>GSoC 2026 · CernVM-FS · CERN-HSF</p></div>
+</footer>
+
+</body>
+</html>

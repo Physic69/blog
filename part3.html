@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Part III: Filling the Structs — Where Does the Data Come From?</title>
+  <meta name="description" content="&quot;The kernel locks the door with ptrace. But it leaves the window open with /proc.&quot;">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="index.html" class="logo"><span>dcoredumper</span></a>
+    <nav class="site-nav">
+      <a href="part1.html">I</a>
+      <a href="part2.html">II</a>
+      <a href="part3.html" class="active">III</a>
+      <a href="part4.html">IV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="article">
+  <div class="container">
+
+    <div class="article-meta">
+      <div class="part-label">Part III</div>
+      <h1>Filling the Structs — Where Does the Data Come From?</h1>
+      <p class="article-subtitle">"The kernel locks the door with ptrace. But it leaves the window open with /proc."</p>
+    </div>
+
+    <p>In Part 2, we learned the anatomy of an ELF core dump — the header, the program headers, and the four types of notes that GDB needs. We know <em>what</em> to write. Now the question is: <strong>where do we get the data?</strong></p>
+<p>The answer is five files in <code>/proc/&lt;pid&gt;/</code>. That&#39;s it. Five virtual files, and we can reconstruct everything GDB needs.</p>
+<p><img src="images/proc_filesystem_map.png" alt="" loading="lazy">
+<p class="img-caption"></p></p>
+<h2>The /proc Filesystem as Our Backdoor</h2>
+<p>Let&#39;s be very precise about why this works. When you read <code>/proc/&lt;pid&gt;/maps</code>, the kernel doesn&#39;t send a signal to the process. It doesn&#39;t ask the process to cooperate. It doesn&#39;t use ptrace. It simply walks its own internal data structures — the <code>mm_struct</code>, the <code>vm_area_struct</code> linked list, the task list — and formats the results as text.</p>
+<p>The process doesn&#39;t even know you&#39;re reading its data. It can&#39;t block you because it&#39;s not involved. This is fundamentally different from ptrace, which requires the target to stop and acknowledge.</p>
+<p>This is why <code>/proc</code> works on D-state processes. The kernel is reading its <em>own</em> bookkeeping, not asking the process to do anything.</p>
+<h2>Memory Maps: <code>/proc/&lt;pid&gt;/maps</code></h2>
+<p>This file gives us the complete memory layout of the process. Every loaded library, every heap allocation, every stack — it&#39;s all here:</p>
+<pre><code class="language-">$ cat /proc/1234/maps
+55a8b1000000-55a8b1025000 r--p 00000000 08:01 1234567  /usr/bin/cvmfs2
+55a8b1025000-55a8b10a0000 r-xp 00025000 08:01 1234567  /usr/bin/cvmfs2
+55a8b10a0000-55a8b10b0000 r--p 000a0000 08:01 1234567  /usr/bin/cvmfs2
+55a8b10b0000-55a8b10b2000 rw-p 000af000 08:01 1234567  /usr/bin/cvmfs2
+7f4a10000000-7f4a10021000 rw-p 00000000 00:00 0        [heap]
+7f4a12340000-7f4a12380000 r--p 00000000 08:01 2345678  /usr/lib64/libc.so.6
+7f4a12380000-7f4a12500000 r-xp 00040000 08:01 2345678  /usr/lib64/libc.so.6
+...
+7ffc8a000000-7ffc8a021000 rw-p 00000000 00:00 0        [stack]
+7ffc8a1f0000-7ffc8a1f4000 r--p 00000000 00:00 0        [vvar]
+7ffc8a1f4000-7ffc8a1f6000 r-xp 00000000 00:00 0        [vdso]</code></pre><p>Each line is one memory region. The format is:</p>
+<pre><code class="language-">start-end  perms  offset  dev  inode  pathname</code></pre><p>We parse this to build our <code>mem_region_t</code> array:</p>
+<pre><code class="language-c">int parse_maps(int pid, mem_region_t **regions_out) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long start, end, offset;
+        char perms[5], name[256] = "";
+
+        sscanf(line, "%lx-%lx %4s %lx %*s %*s %255[^\n]",
+               &amp;start, &amp;end, perms, &amp;offset, name);
+
+        regions[count].start      = start;
+        regions[count].end        = end;
+        regions[count].offset     = offset;
+        regions[count].readable   = (perms[0] == 'r');
+        regions[count].writable   = (perms[1] == 'w');
+        regions[count].executable = (perms[2] == 'x');
+        strncpy(regions[count].name, name, 255);
+
+        count++;
+    }
+    return count;
+}</code></pre><h3>What we learn from each region:</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>What It Tells Us</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>start–end</code></td>
+<td>Virtual address range → becomes <code>p_vaddr</code> in PT_LOAD</td>
+</tr>
+<tr>
+<td><code>perms</code> (rwxp)</td>
+<td>Permissions → becomes <code>p_flags</code> in PT_LOAD</td>
+</tr>
+<tr>
+<td><code>offset</code></td>
+<td>File offset → goes into NT_FILE entries</td>
+</tr>
+<tr>
+<td><code>pathname</code></td>
+<td>Which file is mapped → goes into NT_FILE, also used for dump level filtering</td>
+</tr>
+</tbody></table>
+<h3>The First Region Trick</h3>
+<p>The first file-backed region in <code>/proc/pid/maps</code> is always the main executable. We save this path so that in standard dump mode, we can always keep the executable&#39;s memory while skipping other libraries:</p>
+<pre><code class="language-c">if (g_exe_path[0] == '\0' &amp;&amp; name[0] == '/') {
+    strncpy(g_exe_path, name, sizeof(g_exe_path) - 1);
+}</code></pre><h3>Regions We Skip</h3>
+<p>Some kernel-mapped regions cause <code>EIO</code> (Input/Output error) when you try to read them via <code>/proc/pid/mem</code>. We filter these out:</p>
+<pre><code class="language-c">static int should_dump_region(const mem_region_t *r) {
+    if (!r-&gt;readable) return 0;
+    if (strstr(r-&gt;name, "[vvar]"))        return 0;  // kernel clock data
+    if (strstr(r-&gt;name, "[vvar_vclock]")) return 0;  // variant clock
+    if (strstr(r-&gt;name, "[vsyscall]"))    return 0;  // legacy syscall page
+    // ... dump level logic follows
+}</code></pre><p><code>[vvar]</code> is a kernel-mapped page that provides fast clock access. It&#39;s readable in userspace, but reading it through <code>/proc/pid/mem</code> from another process triggers <code>EIO</code>. Same for <code>[vsyscall]</code>. We skip these because they contain no useful diagnostic data anyway.</p>
+<h2>CPU Registers: <code>/proc/&lt;pid&gt;/task/&lt;tid&gt;/syscall</code></h2>
+<p>This is the most interesting data source. When a thread is blocked in a system call, the kernel records the syscall state in <code>/proc/&lt;pid&gt;/task/&lt;tid&gt;/syscall</code>:</p>
+<pre><code class="language-">$ cat /proc/1234/task/1234/syscall
+0 0x7 0x7f4a12345678 0x1000 0x0 0x0 0x0 0x7ffc89ffee80 0x7f4a12367890</code></pre><p>The format is:</p>
+<pre><code class="language-">syscall_nr  arg0  arg1  arg2  arg3  arg4  arg5  RSP  RIP</code></pre><p>Those last two values are gold: <strong>RSP</strong> (stack pointer) and <strong>RIP</strong> (instruction pointer) — the two registers GDB needs most.</p>
+<p>But wait — there are 27 registers in the x86_64 <code>user_regs_struct</code>, and we only get 9 values. Where do the rest come from?</p>
+<h3>Mapping Syscall Arguments to Registers</h3>
+<p>The Linux x86_64 syscall calling convention defines which register carries which argument:</p>
+<pre><code class="language-c">// /proc/pid/syscall format:
+// syscall_nr  a0   a1   a2   a3   a4   a5   RSP  RIP
+//
+// Linux x86_64 syscall convention:
+// a0 = RDI, a1 = RSI, a2 = RDX, a3 = R10, a4 = R8, a5 = R9
+
+memset(regs, 0, 27 * sizeof(unsigned long));
+
+regs[15] = nr;   // ORIG_RAX — which syscall was called
+regs[10] = nr;   // RAX — return value (set to syscall nr while blocked)
+regs[14] = a0;   // RDI — 1st argument
+regs[13] = a1;   // RSI — 2nd argument
+regs[12] = a2;   // RDX — 3rd argument
+regs[7]  = a3;   // R10 — 4th argument
+regs[9]  = a4;   // R8  — 5th argument
+regs[8]  = a5;   // R9  — 6th argument
+regs[19] = rsp;  // RSP — stack pointer
+regs[16] = rip;  // RIP — instruction pointer
+
+// User-mode segment selectors (constant for all userspace code)
+regs[17] = 0x33; // CS — code segment
+regs[20] = 0x2b; // SS — stack segment</code></pre><p>The registers we can&#39;t get from <code>/proc/pid/syscall</code> (like R11, R12, R13, R14, R15, RBX) are left as zero. GDB handles this gracefully — it just shows <code>&lt;unavailable&gt;</code> for those values. The important ones (RIP, RSP, and the syscall arguments) are all present.</p>
+<p>But there&#39;s one critical register missing: <strong>RBP</strong>.</p>
+<h2>The RBP Problem and Heuristic Recovery</h2>
+<h3>Why RBP Matters</h3>
+<p>When you compile C code with frame pointers (the default on most Linux distributions), every function creates a <strong>frame pointer chain</strong> on the stack:</p>
+<pre><code class="language-">+-----------------+  &lt;-- higher addresses (stack bottom)
+|   saved RBP     |  --- points to caller's frame
+|   return addr   |  --- where to return after this function
+|   local vars    |
++-----------------+
+|   saved RBP     |  --- points to parent's frame
+|   return addr   |  --- where parent was executing
+|   local vars    |
++-----------------+
+|   saved RBP     |  --- points to grandparent's frame
+|   return addr   |  --- where grandparent was executing
+|   local vars    |
++-----------------+
+|       ...       |
++-----------------+  &lt;-- lower addresses (RSP points here)</code></pre><p>GDB walks this chain to produce a backtrace:</p>
+<ol>
+<li>Read RBP → that&#39;s the current frame</li>
+<li>At address <code>RBP</code>, read the saved RBP → that&#39;s the caller&#39;s frame  </li>
+<li>At address <code>RBP + 8</code>, read the return address → that&#39;s where the caller was executing</li>
+<li>Repeat until saved RBP is 0 (top of the call chain)</li>
+</ol>
+<p>Without RBP, GDB can only show you frame 0 (the current function from RIP) and frame 1 (by scanning the stack for the return address). The rest of the backtrace is lost.</p>
+<h3>The Problem</h3>
+<p><code>/proc/&lt;pid&gt;/task/&lt;tid&gt;/syscall</code> gives us RSP and RIP but <strong>not</strong> RBP. The kernel simply doesn&#39;t expose it through this interface.</p>
+<p>For some binaries, this doesn&#39;t matter — if they were compiled with DWARF <code>.eh_frame</code> unwind information (which most modern code is), GDB can use the CFI (Call Frame Information) tables to unwind the stack without RBP. But for code compiled with <code>-fomit-frame-pointer</code> and without DWARF info, or in complex cases where DWARF and frame pointers interact, having the real RBP makes backtraces significantly more reliable.</p>
+<h3>The Heuristic</h3>
+<p>Our approach: <strong>scan the stack for values that look like valid frame pointers, and pick the one with the longest valid chain.</strong></p>
+<p><img src="images/rbp_recovery_heuristic.png" alt="" loading="lazy">
+<p class="img-caption"></p></p>
+<p>Here&#39;s the algorithm:</p>
+<pre><code class="language-">1. Find the stack region that contains RSP
+2. Read 4KB of stack above RSP into a local buffer
+3. For every 8-byte-aligned value on the stack:
+   a. Does it point to a valid stack address? If not, skip.
+   b. Read 16 bytes at that address from /proc/pid/mem:
+      - First 8 bytes = saved_rbp
+      - Next 8 bytes = return_address
+   c. Is the return_address inside an executable memory region? If not, skip.
+   d. Walk the chain: does saved_rbp also point to a valid frame?
+   e. Count the chain depth
+4. The candidate with the deepest valid chain wins</code></pre><p>Let&#39;s look at the key functions:</p>
+<h4>Validation: Is This a Real Return Address?</h4>
+<pre><code class="language-c">static int is_executable_addr(unsigned long addr,
+                              const mem_region_t *regions,
+                              int num_regions) {
+    for (int i = 0; i &lt; num_regions; i++) {
+        if (regions[i].executable &amp;&amp;
+            addr &gt;= regions[i].start &amp;&amp;
+            addr &lt; regions[i].end)
+            return 1;
+    }
+    return 0;
+}</code></pre><p>If <code>*(candidate + 8)</code> falls inside an executable region (like <code>.text</code> of libc or cvmfs2), it&#39;s likely a real return address. Random data on the stack almost never happens to fall inside executable pages.</p>
+<h4>Chain Walking: How Deep Does It Go?</h4>
+<pre><code class="language-c">static int walk_fp_chain(unsigned long rbp_candidate,
+                         int mem_fd,
+                         unsigned long stack_lo,
+                         unsigned long stack_hi,
+                         const mem_region_t *regions,
+                         int num_regions,
+                         int max_depth) {
+    unsigned long fp = rbp_candidate;
+    int depth = 0;
+
+    while (depth &lt; max_depth) {
+        unsigned long frame[2];  // [saved_rbp, return_addr]
+        ssize_t n = pread(mem_fd, frame, 16, (off_t)fp);
+        if (n &lt; 16) break;
+
+        unsigned long saved_rbp = frame[0];
+        unsigned long ret_addr  = frame[1];
+
+        // Return address must be in executable memory
+        if (!is_executable_addr(ret_addr, regions, num_regions))
+            break;
+
+        depth++;
+
+        if (saved_rbp == 0) break;           // Top of chain (main)
+        if (saved_rbp &lt;= fp) break;           // Must move upward in stack
+        if (saved_rbp &lt; stack_lo ||
+            saved_rbp &gt;= stack_hi) break;     // Must stay on stack
+
+        fp = saved_rbp;  // Follow the chain
+    }
+
+    return depth;
+}</code></pre><p>The beauty of this approach is that <strong>false positives are extremely rare</strong>. For a random value on the stack to pass all these checks, it would need to:</p>
+<ol>
+<li>Point to another stack address</li>
+<li>Where the next 8 bytes happen to be inside executable memory</li>
+<li>And the 8 bytes before that point to yet another valid stack+code pair</li>
+<li>And this chain would need to continue for multiple levels</li>
+</ol>
+<p>The chance of this happening with garbage data is astronomically small. In practice, the heuristic finds the correct RBP on the first try for frame-pointer-compiled code.</p>
+<div class="mermaid">flowchart TD
+    A["Read 4KB of stack above RSP"] --> B["For each 8-byte value"]
+    B --> C{"Points to\nstack address?"}
+    C -->|No| B
+    C -->|Yes| D{"*(val+8) in\nexecutable memory?"}
+    D -->|No| B
+    D -->|Yes| E["Walk chain:\nfollow saved_rbp pointers"]
+    E --> F{"Chain depth\n> best so far?"}
+    F -->|No| B
+    F -->|Yes| G["New best candidate"]
+    G --> B
+    B -->|"Done scanning"| H["Return best RBP\n(deepest chain wins)"]
+
+    style G fill:#cfc,stroke:#393
+    style H fill:#cfc,stroke:#393</div><h4>The Result</h4>
+<p>When RBP recovery succeeds, the difference is dramatic:</p>
+<p><strong>Without RBP recovery:</strong></p>
+<pre><code class="language-">(gdb) bt
+#0  __internal_syscall_cancel (...) at cancellation.c:44
+#1  __pthread_cond_wait_common (cond=..., mutex=...) at pthread_cond_wait.c:421</code></pre><p>Two frames. We know it&#39;s stuck in a condition wait, but we have no idea <em>why</em> it&#39;s waiting, or what the full call chain looks like.</p>
+<p><strong>With RBP recovery:</strong></p>
+<pre><code class="language-">(gdb) bt
+#0  __internal_syscall_cancel (...) at cancellation.c:44
+#1  __pthread_cond_wait_common (cond=..., mutex=...) at pthread_cond_wait.c:421
+#2  ___pthread_cond_wait (...) at pthread_cond_wait.c:453
+#3  Tube&lt;download::DataTubeElement&gt;::PopFront (...) at .../cvmfs/util/tube.h:125
+#4  download::DownloadManager::Fetch (...) at .../cvmfs/network/download.cc:2045
+#5  cvmfs::Fetcher::Fetch (...) at .../cvmfs/fetch.cc:177
+#6  catalog::ClientCatalogManager::StageNestedCatalogByHash (...) at .../cvmfs/catalog_mgr_client.cc:379
+#7  catalog::AbstractCatalogManager::StageNestedCatalogAndUnlock (...) at .../cvmfs/catalog_mgr_impl.h:865
+#8  catalog::AbstractCatalogManager::LookupPath (...) at .../cvmfs/catalog_mgr_impl.h:287
+#9  cvmfs::GetDirentForPath (path=...) at .../cvmfs/cvmfs.cc:428
+#10 cvmfs::cvmfs_lookup (req=..., parent=55380, name=0x... "alma9-alice-20260427_2") at .../cvmfs/cvmfs.cc:580
+#11 loader::stub_lookup (...) at .../cvmfs/loader.cc:217</code></pre><p>Twelve frames. Now we can see the entire story: a FUSE lookup → catalog manager → download manager → blocking <code>PopFront()</code> on a tube waiting for a catalog download. That&#39;s the information a developer needs to fix the bug.</p>
+<h2>Thread Enumeration: <code>/proc/&lt;pid&gt;/task/</code></h2>
+<p>Each subdirectory in <code>/proc/&lt;pid&gt;/task/</code> is a thread ID:</p>
+<pre><code class="language-">$ ls /proc/1234/task/
+1234  1235  1236  1237  1238  1239  1240</code></pre><p>We enumerate all of them and read registers for each:</p>
+<pre><code class="language-c">int enumerate_threads(int pid, thread_info_t **threads_out) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task", pid);
+    DIR *dir = opendir(path);
+
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (entry-&gt;d_name[0] == '.') continue;
+
+        int tid = atoi(entry-&gt;d_name);
+        threads[count].tid = tid;
+
+        int ret = read_thread_registers(pid, tid, threads[count].regs);
+        if (ret == 0) {
+            count++;  // Successfully read registers
+        } else if (ret == -2) {
+            // Thread is running in userspace, not in a syscall
+            // Still include it, but registers will be partial
+            count++;
+        }
+    }
+    // ...
+}</code></pre><h3>The Main Thread First Rule</h3>
+<p>GDB treats the <strong>first</strong> NT_PRSTATUS note in the core as the &quot;current thread&quot; — the one shown by default when you open the core. We want this to be the main thread (TID == PID), so after collecting all threads, we swap it to index 0:</p>
+<pre><code class="language-c">for (int i = 1; i &lt; count; i++) {
+    if (threads[i].tid == pid) {
+        thread_info_t tmp = threads[0];
+        threads[0] = threads[i];
+        threads[i] = tmp;
+        break;
+    }
+}</code></pre><p>This is a small detail, but it matters for UX. When someone opens the core in GDB, they should see the main thread&#39;s state first, not a random worker thread.</p>
+<h3>Running vs. Blocked Threads</h3>
+<p>Not all threads will be in a syscall. Some might be actively running on a CPU in userspace. For these, <code>/proc/&lt;pid&gt;/task/&lt;tid&gt;/syscall</code> returns the string <code>&quot;running&quot;</code> instead of register values:</p>
+<pre><code class="language-c">if (strncmp(line, "running", 7) == 0)
+    return -2;  // distinct from -1 (error)</code></pre><p>We still include these threads in the core — their registers will be zeroed, but GDB will at least show them in the thread list. This is honest: we&#39;re telling the user &quot;this thread exists but we couldn&#39;t capture its state.&quot;</p>
+<h2>Auxiliary Vector: <code>/proc/&lt;pid&gt;/auxv</code></h2>
+<p>The simplest data source. The auxiliary vector is a binary blob — we just read and embed it as-is:</p>
+<pre><code class="language-c">int read_auxv(int pid, char **data_out, size_t *sz_out) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/auxv", pid);
+    int fd = open(path, O_RDONLY);
+
+    char *data = malloc(4096);
+    size_t sz = 0;
+    ssize_t n;
+
+    while ((n = read(fd, data + sz, 4096 - sz)) &gt; 0)
+        sz += n;
+
+    close(fd);
+    *data_out = data;
+    *sz_out = sz;
+    return 0;
+}</code></pre><p>No parsing needed. The kernel provides it in exactly the format GDB expects.</p>
+<h2>Raw Memory: <code>/proc/&lt;pid&gt;/mem</code></h2>
+<p>This is how we read the actual memory contents for the PT_LOAD segments. The <code>/proc/&lt;pid&gt;/mem</code> file is a virtual file that mirrors the process&#39;s entire address space. You can <code>pread()</code> at any virtual address:</p>
+<pre><code class="language-c">// Read one page of the process's memory at virtual address 0x7ffc89ff0000
+unsigned char page[4096];
+ssize_t n = pread(mem_fd, page, 4096, 0x7ffc89ff0000);</code></pre><p>This is remarkable. We&#39;re reading another process&#39;s memory without ptrace, without signals, without cooperation. The kernel handles it internally through its page table management.</p>
+<h3>Page-by-Page Reads</h3>
+<p>We don&#39;t try to read entire regions at once. A 8MB stack region might have guard pages in the middle — deliberately unmapped pages that catch stack overflows. Reading a guard page returns <code>EIO</code>:</p>
+<pre><code class="language-c">for (size_t offset = 0; offset &lt; region_size; offset += PAGE_SIZE) {
+    unsigned char page[4096];
+    ssize_t n = pread(mem_fd, page, PAGE_SIZE,
+                      regions[i].start + offset);
+
+    if (n &lt;= 0) {
+        // Guard page, unmapped page, or read error
+        memset(page, 0, PAGE_SIZE);  // Zero-fill instead of aborting
+        zeroed += PAGE_SIZE;
+    }
+
+    fwrite(page, PAGE_SIZE, 1, core_file);
+}</code></pre><p>Zero-filling is the key technique here. If we abort on the first failed page read, we lose everything. If we skip pages, the file offsets become wrong and the core is corrupted. By writing zeros for unreadable pages, we maintain consistent offsets while gracefully handling any memory layout surprises.</p>
+<div class="mermaid">flowchart LR
+    A["Region: 0x7ffc8a000000\n8MB, rw-p, [stack]"] --> B["Page 0: pread OK → write"]
+    B --> C["Page 1: pread OK → write"]
+    C --> D["Page 2: pread EIO\n(guard page)"]
+    D --> E["Write 4096 zeros"]
+    E --> F["Page 3: pread OK → write"]
+    F --> G["...continue..."]
+
+    style D fill:#fee,stroke:#c33
+    style E fill:#ffe,stroke:#cc3</div><h2>Summary: The Data Pipeline</h2>
+<p>Here&#39;s the complete picture of where every piece of the core dump comes from:</p>
+<table>
+<thead>
+<tr>
+<th>Core Dump Component</th>
+<th>Data Source</th>
+<th>Key Info Extracted</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ELF Header</td>
+<td>Hardcoded</td>
+<td><code>ET_CORE</code>, <code>EM_X86_64</code></td>
+</tr>
+<tr>
+<td>PT_LOAD headers</td>
+<td><code>/proc/pid/maps</code></td>
+<td>Address ranges, permissions, sizes</td>
+</tr>
+<tr>
+<td>NT_PRSTATUS (registers)</td>
+<td><code>/proc/pid/task/*/syscall</code></td>
+<td>RSP, RIP + syscall args → mapped to register slots</td>
+</tr>
+<tr>
+<td>NT_PRSTATUS (RBP)</td>
+<td><code>/proc/pid/mem</code> + heuristic</td>
+<td>Stack scanning for frame pointer chains</td>
+</tr>
+<tr>
+<td>NT_PRPSINFO</td>
+<td><code>/proc/pid/cmdline</code></td>
+<td>Process name, command line</td>
+</tr>
+<tr>
+<td>NT_FILE</td>
+<td><code>/proc/pid/maps</code></td>
+<td>File-backed regions → filenames</td>
+</tr>
+<tr>
+<td>NT_AUXV</td>
+<td><code>/proc/pid/auxv</code></td>
+<td>Raw binary blob, embedded as-is</td>
+</tr>
+<tr>
+<td>LOAD segment data</td>
+<td><code>/proc/pid/mem</code></td>
+<td>Page-by-page reads with zero-fill fallback</td>
+</tr>
+</tbody></table>
+<p>In Part 4, we&#39;ll put it all together — the actual <code>build_core()</code> function that orchestrates everything into a single, GDB-compatible ELF core file.</p>
+
+
+    <div class="article-nav"><a href="part2.html"><span class="dir">← Previous</span><span class="title">Part 2: The ELF Core Dump</span></a><a href="part4.html" class="next"><span class="dir">Next →</span><span class="title">Part 4: Assembling the Core Dump</span></a></div>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container"><p>GSoC 2026 · CernVM-FS · CERN-HSF</p></div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'dark' });</script>
+
+</body>
+</html>

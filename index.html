@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Debugging Without ptrace</title>
+  <meta name="description" content="How we built a userspace core dump generator to debug D-state hangs in CernVM-FS — a GSoC 2026 project.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="index.html" class="logo"><span>dcoredumper</span></a>
+    <nav class="site-nav">
+      <a href="part1.html">I</a>
+      <a href="part2.html">II</a>
+      <a href="part3.html">III</a>
+      <a href="part4.html">IV</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="container">
+      <p class="kicker">GSoC 2026 · CernVM-FS · CERN-HSF</p>
+      <h1>Debugging Without ptrace</h1>
+      <p class="subtitle">A four-part write-up on building a userspace core dump generator to debug D-state hangs in CernVM-FS. No ptrace. No signals. No cooperation from the target process.</p>
+      <p class="author"><a href="https://github.com/Physic69">github/Physic69</a> · <a href="https://github.com/cvmfs/cvmfs/pull/4314">PR #4314</a> · <a href="https://cernvm.cern.ch/fs/">cernvm.cern.ch/fs</a></p>
+    </div>
+  </section>
+
+  <section class="container parts-toc">
+    <p class="toc-heading">Contents</p>
+
+    <a href="part1.html" class="part-entry">
+      <div class="part-num">I</div>
+      <div class="part-title">How Debuggers Work (and Why They Break)</div>
+      <div class="part-desc">The ptrace contract, D-state processes, and why GDB hangs forever when you need it most. The /proc backdoor that makes everything else possible.</div>
+    </a>
+
+    <a href="part2.html" class="part-entry">
+      <div class="part-num">II</div>
+      <div class="part-title">The ELF Core Dump — A Dead Process's Autobiography</div>
+      <div class="part-desc">What's actually inside a core file, byte by byte. ELF headers, NT_PRSTATUS registers, NT_FILE mappings, and the offset arithmetic that holds it all together.</div>
+    </a>
+
+    <a href="part3.html" class="part-entry">
+      <div class="part-num">III</div>
+      <div class="part-title">Filling the Structs — /proc as Our Backdoor</div>
+      <div class="part-desc">Pulling registers out of /proc/pid/syscall, the RBP heuristic that turns a two-frame backtrace into a full call stack, and page-by-page memory reads.</div>
+    </a>
+
+    <a href="part4.html" class="part-entry">
+      <div class="part-num">IV</div>
+      <div class="part-title">Assembling the Core Dump</div>
+      <div class="part-desc">The build_core() pipeline, dump levels (standard vs full), the dynamic linker trick, and the moment of truth — loading the output in GDB.</div>
+    </a>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p>GSoC 2026 · CernVM-FS · CERN-HSF</p>
+  </div>
+</footer>
+
+</body>
+</html>

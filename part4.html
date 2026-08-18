@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Part IV: Assembling the Core Dump</title>
+  <meta name="description" content="&quot;Getting the data is the hard part. Putting it together is just bookkeeping — but the bookkeeping has to be perfect.&quot;">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="index.html" class="logo"><span>dcoredumper</span></a>
+    <nav class="site-nav">
+      <a href="part1.html">I</a>
+      <a href="part2.html">II</a>
+      <a href="part3.html">III</a>
+      <a href="part4.html" class="active">IV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="article">
+  <div class="container">
+
+    <div class="article-meta">
+      <div class="part-label">Part IV</div>
+      <h1>Assembling the Core Dump</h1>
+      <p class="article-subtitle">"Getting the data is the hard part. Putting it together is just bookkeeping — but the bookkeeping has to be perfect."</p>
+    </div>
+
+    <p>We&#39;ve covered the theory. We know the ELF core dump format (Part 2) and where all the data comes from (Part 3). Now it&#39;s time to walk through the actual <code>build_core()</code> function — the 300-line orchestrator that takes raw <code>/proc</code> data and produces a file GDB can read.</p>
+<p>This is also where we&#39;ll cover <strong>dump levels</strong> — the difference between a 500MB full dump and a 20MB standard dump that still gives you perfect backtraces.</p>
+<p><img src="images/build_pipeline.png" alt="" loading="lazy">
+<p class="img-caption"></p></p>
+<h2>The Five-Stage Pipeline</h2>
+<p>The core dump assembly happens in five stages, and the order is non-negotiable — every stage depends on calculations from the previous one:</p>
+<div class="mermaid">flowchart TB
+    A["Stage 1: GATHER\nParse maps, read registers,\nread auxv, open /proc/pid/mem"] --> B["Stage 2: CALCULATE\nCount regions, compute note sizes,\nsolve offset arithmetic"]
+    B --> C["Stage 3: WRITE HEADERS\nELF header → PT_NOTE phdr\n→ N × PT_LOAD phdrs"]
+    C --> D["Stage 4: WRITE NOTES\nNT_PRSTATUS × threads\n→ NT_PRPSINFO → NT_FILE → NT_AUXV"]
+    D --> E["Stage 5: WRITE MEMORY\nPage-by-page pread\n→ zero-fill failures"]
+
+    style A fill:#e8f4fd
+    style B fill:#e8fde8
+    style C fill:#fdf8e8
+    style D fill:#fde8e8
+    style E fill:#f0e8fd</div><p>Let&#39;s walk through each one.</p>
+<h2>Stage 1: Gather Everything</h2>
+<p>The function starts by collecting all the raw data from <code>/proc</code>:</p>
+<pre><code class="language-c">int build_core(int pid, const char *output_path) {
+    printf("---- dcoredumper ----\n");
+    printf("Target PID:   %d\n", pid);
+    printf("Output:       %s\n", output_path);
+    printf("Architecture: x86_64\n");
+    printf("Dump level:   %s\n",
+           g_level == DUMP_STANDARD ? "standard" : "full");</code></pre><p>Then four data-gathering calls:</p>
+<pre><code class="language-c">    // 1. Memory map — what's loaded where
+    mem_region_t *regions = NULL;
+    int num_regions = parse_maps(pid, &amp;regions);
+
+    // 2. Open /proc/pid/mem for raw memory access
+    int mem_fd = open("/proc/&lt;pid&gt;/mem", O_RDONLY);
+
+    // 3. Thread registers — RSP + RIP for every thread
+    thread_info_t *threads = NULL;
+    int num_threads = enumerate_threads(pid, &amp;threads);
+
+    // 4. Auxiliary vector — kernel metadata
+    char *auxv_data = NULL;
+    size_t auxv_sz = 0;
+    read_auxv(pid, &amp;auxv_data, &amp;auxv_sz);</code></pre><p>At this point, we also do <strong>RBP recovery</strong> for each thread. This is the heuristic from Part 3 — scanning the stack for frame pointer chains:</p>
+<pre><code class="language-c">    for (int i = 0; i &lt; num_threads; i++) {
+        unsigned long rsp = threads[i].regs[X86_64_REG_RSP];
+
+        // If RSP is set but RBP is missing, try to recover it
+        if (rsp != 0 &amp;&amp; threads[i].regs[X86_64_REG_RBP] == 0) {
+            unsigned long rbp = recover_rbp(mem_fd, rsp,
+                                            regions, num_regions);
+            if (rbp != 0) {
+                threads[i].regs[X86_64_REG_RBP] = rbp;
+            }
+        }
+    }</code></pre><p>We do this <em>before</em> writing anything because we need the final register values when we write NT_PRSTATUS later.</p>
+<h2>Stage 2: The Offset Arithmetic</h2>
+<p>This is the trickiest part. Every program header contains a file offset that must point to the exact right byte. If any offset is wrong by even one byte, GDB will read garbage.</p>
+<p>First, count how many regions we&#39;ll actually dump:</p>
+<pre><code class="language-c">    int loadable = 0;
+    for (int i = 0; i &lt; num_regions; i++) {
+        if (should_dump_region(&amp;regions[i])) loadable++;
+    }</code></pre><p>Then calculate note section sizes:</p>
+<pre><code class="language-c">    // NT_PRSTATUS: one per thread
+    // Each note = 12-byte header + 8-byte name + padded descriptor
+    size_t per_prstatus   = sizeof(Elf64_Nhdr) + 8 + NOTE_ALIGN(336);
+    size_t total_prstatus = per_prstatus * num_threads;
+
+    // NT_PRPSINFO: one per process
+    size_t prpsinfo_sz = sizeof(Elf64_Nhdr) + 8 + NOTE_ALIGN(136);
+
+    // NT_FILE: variable size (depends on number of file-backed regions)
+    uint64_t file_count = 0;
+    size_t strings_len = 0;
+    for (int i = 0; i &lt; num_regions; i++) {
+        if (regions[i].name[0] == '/') {
+            file_count++;
+            strings_len += strlen(regions[i].name) + 1;
+        }
+    }
+    size_t file_desc_sz = 16 + (file_count * 24) + strings_len;
+    size_t file_note_sz = sizeof(Elf64_Nhdr) + 8 + NOTE_ALIGN(file_desc_sz);
+
+    // NT_AUXV: variable size
+    size_t auxv_note_sz = sizeof(Elf64_Nhdr) + 8 + NOTE_ALIGN(auxv_sz);
+
+    // Grand total
+    size_t all_notes_sz = total_prstatus + prpsinfo_sz
+                        + file_note_sz + auxv_note_sz;</code></pre><p>Now solve the offset chain:</p>
+<pre><code class="language-c">    // Program header table starts right after ELF header
+    size_t phdr_total  = (1 + loadable) * sizeof(Elf64_Phdr);
+
+    // Notes start after all headers
+    size_t note_offset = sizeof(Elf64_Ehdr) + phdr_total;
+
+    // Memory data starts after all notes
+    size_t data_offset = note_offset + all_notes_sz;</code></pre><p>Here&#39;s how this looks visually:</p>
+<pre><code class="language-">Byte 0                          → ELF header (64 bytes)
+Byte 64                         → Program headers ((1+N) × 56 bytes)
+Byte 64 + phdr_total            → NOTE segment starts
+Byte 64 + phdr_total + notes_sz → First LOAD segment data starts</code></pre><div class="mermaid">flowchart LR
+    A["ELF Header\n64 bytes"] --> B["Program Headers\n(1+N) × 56 bytes"]
+    B --> C["Notes\nvariable size"]
+    C --> D["LOAD 0 data\nregion_size[0]"]
+    D --> E["LOAD 1 data\nregion_size[1]"]
+    E --> F["..."]
+
+    A ---|"offset 0"| A
+    B ---|"offset 64"| B
+    C ---|"note_offset"| C
+    D ---|"data_offset"| D</div><p>Every single one of these values must be computed <strong>before</strong> we write a single byte, because the program headers (written second) reference the note and data offsets (written later).</p>
+<h2>Stage 3: Write the Headers</h2>
+<p>Now we open the output file and start writing. First, the ELF header:</p>
+<pre><code class="language-c">    FILE *core = fopen(output_path, "wb");
+
+    Elf64_Ehdr ehdr;
+    memset(&amp;ehdr, 0, sizeof(ehdr));
+    memcpy(ehdr.e_ident, ELFMAG, SELFMAG);
+    ehdr.e_ident[EI_CLASS]   = ELFCLASS64;
+    ehdr.e_ident[EI_DATA]    = ELFDATA2LSB;
+    ehdr.e_ident[EI_VERSION] = EV_CURRENT;
+    ehdr.e_ident[EI_OSABI]   = ELFOSABI_LINUX;
+    ehdr.e_type              = ET_CORE;
+    ehdr.e_machine           = EM_X86_64;
+    ehdr.e_version           = EV_CURRENT;
+    ehdr.e_phoff             = sizeof(Elf64_Ehdr);  // 64
+    ehdr.e_ehsize            = sizeof(Elf64_Ehdr);  // 64
+    ehdr.e_phentsize         = sizeof(Elf64_Phdr);  // 56
+    ehdr.e_phnum             = 1 + loadable;
+    fwrite(&amp;ehdr, sizeof(ehdr), 1, core);</code></pre><p>Then the PT_NOTE program header:</p>
+<pre><code class="language-c">    Elf64_Phdr note_phdr;
+    memset(&amp;note_phdr, 0, sizeof(note_phdr));
+    note_phdr.p_type   = PT_NOTE;
+    note_phdr.p_offset = note_offset;
+    note_phdr.p_filesz = all_notes_sz;
+    fwrite(&amp;note_phdr, sizeof(note_phdr), 1, core);</code></pre><p>Then one PT_LOAD header per dumpable region, with a running offset counter:</p>
+<pre><code class="language-c">    size_t cur_offset = data_offset;
+    for (int i = 0; i &lt; num_regions; i++) {
+        if (!should_dump_region(&amp;regions[i])) continue;
+
+        size_t seg_size = regions[i].end - regions[i].start;
+
+        Elf64_Phdr phdr;
+        memset(&amp;phdr, 0, sizeof(phdr));
+        phdr.p_type   = PT_LOAD;
+        phdr.p_offset = cur_offset;       // where in the file
+        phdr.p_vaddr  = regions[i].start;  // original virtual address
+        phdr.p_filesz = seg_size;
+        phdr.p_memsz  = seg_size;
+        phdr.p_flags  = PF_R;
+        if (regions[i].writable)   phdr.p_flags |= PF_W;
+        if (regions[i].executable) phdr.p_flags |= PF_X;
+        phdr.p_align  = PAGE_SIZE;
+
+        fwrite(&amp;phdr, sizeof(phdr), 1, core);
+        cur_offset += seg_size;  // advance for next region
+    }</code></pre><p>Notice how <code>cur_offset</code> accumulates. Each PT_LOAD header points to the <em>next</em> available file position. By the time we finish writing all headers, we know exactly where each region&#39;s data will land in the file.</p>
+<h2>Stage 4: Write the Notes</h2>
+<p>Now we&#39;re at the note offset. We write the four note types in order:</p>
+<h3>NT_PRSTATUS — One Per Thread</h3>
+<pre><code class="language-c">    for (int i = 0; i &lt; num_threads; i++) {
+        unsigned char *prstatus = calloc(1, 336);
+
+        // Thread ID at offset 32
+        *(pid_t *)(prstatus + 32) = (pid_t)threads[i].tid;
+
+        // All 27 registers at offset 112
+        memcpy(prstatus + 112,
+               threads[i].regs,
+               27 * sizeof(unsigned long));
+
+        write_note(core, 1 /* NT_PRSTATUS */, prstatus, 336);
+        free(prstatus);
+    }</code></pre><h3>NT_PRPSINFO — Process Identity</h3>
+<pre><code class="language-c">    unsigned char *prpsinfo = calloc(1, 136);
+
+    prpsinfo[0] = 2;    // pr_state = TASK_UNINTERRUPTIBLE
+    prpsinfo[1] = 'D';  // pr_sname
+
+    *(pid_t *)(prpsinfo + 24) = (pid_t)pid;
+
+    // Read command line from /proc/pid/cmdline
+    // Extract basename for pr_fname (max 15 chars)
+    // Copy full cmdline for pr_psargs (max 80 chars)
+
+    write_note(core, 3 /* NT_PRPSINFO */, prpsinfo, 136);</code></pre><h3>NT_FILE — File Mappings</h3>
+<p>This is the most complex note to construct. It has a custom binary format:</p>
+<pre><code class="language-c">    // Layout:
+    //   uint64_t count       — number of file entries
+    //   uint64_t page_size   — 4096
+    //   count × { start, end, offset_in_pages }
+    //   count × null-terminated filename strings
+
+    char *file_desc = calloc(1, file_desc_sz);
+
+    uint64_t *hdr = (uint64_t *)file_desc;
+    hdr[0] = file_count;   // how many entries
+    hdr[1] = PAGE_SIZE;    // page size
+
+    uint64_t *entries = &amp;hdr[2];
+    char *strtab = (char *)&amp;entries[file_count * 3];
+
+    int idx = 0;
+    char *sp = strtab;
+    for (int i = 0; i &lt; num_regions; i++) {
+        if (regions[i].name[0] != '/') continue;
+
+        entries[idx * 3 + 0] = regions[i].start;
+        entries[idx * 3 + 1] = regions[i].end;
+        entries[idx * 3 + 2] = regions[i].offset / PAGE_SIZE;
+
+        strcpy(sp, regions[i].name);
+        sp += strlen(regions[i].name) + 1;
+        idx++;
+    }
+
+    write_note(core, 0x46494c45 /* NT_FILE */, file_desc, file_desc_sz);</code></pre><p>One subtlety: the <code>n_type</code> for NT_FILE is <code>0x46494c45</code>, which is the ASCII encoding of <code>&quot;FILE&quot;</code>. The kernel uses this as a magic number. Other note types use small integers (1 for PRSTATUS, 3 for PRPSINFO, 6 for AUXV).</p>
+<h3>NT_AUXV — Auxiliary Vector</h3>
+<p>The simplest note — just a raw blob:</p>
+<pre><code class="language-c">    if (auxv_data) {
+        write_note(core, 6 /* NT_AUXV */, auxv_data, auxv_sz);
+    }</code></pre><h3>The write_note Helper</h3>
+<p>All four notes go through the same writer:</p>
+<pre><code class="language-c">size_t write_note(FILE *out, uint32_t type,
+                  const void *desc, size_t desc_sz) {
+
+    Elf64_Nhdr nhdr;
+    nhdr.n_namesz = 5;        // "CORE\0"
+    nhdr.n_descsz = desc_sz;
+    nhdr.n_type   = type;
+
+    char name_padded[8] = {'C','O','R','E','\0','\0','\0','\0'};
+
+    fwrite(&amp;nhdr,       sizeof(nhdr), 1, out);  // 12 bytes
+    fwrite(name_padded, 8,            1, out);  // 8 bytes (padded to 4)
+    fwrite(desc,        desc_sz,      1, out);  // descriptor
+
+    // Pad descriptor to 4-byte boundary
+    size_t pad = NOTE_ALIGN(desc_sz) - desc_sz;
+    if (pad &gt; 0) {
+        char zeros[4] = {0};
+        fwrite(zeros, pad, 1, out);
+    }
+
+    return sizeof(nhdr) + 8 + NOTE_ALIGN(desc_sz);
+}</code></pre><p>The name is always <code>&quot;CORE\0&quot;</code> padded to 8 bytes (4-byte aligned with 3 extra null bytes). The descriptor is padded to the next 4-byte boundary. This alignment is mandated by the ELF spec — violate it and GDB can&#39;t parse the notes.</p>
+<h2>Stage 5: Write the Memory</h2>
+<p>Now the bulk of the file — the actual memory contents. This is where dump levels make a real difference.</p>
+<h3>The Dump Loop</h3>
+<pre><code class="language-c">    for (int i = 0; i &lt; num_regions; i++) {
+        if (!should_dump_region(&amp;regions[i])) continue;
+
+        size_t seg_size = regions[i].end - regions[i].start;
+        unsigned long addr = regions[i].start;
+        size_t rem = seg_size;
+
+        while (rem &gt; 0) {
+            size_t chunk = rem &gt; PAGE_SIZE ? PAGE_SIZE : rem;
+
+            ssize_t n = pread(mem_fd, buf, chunk, (off_t)addr);
+
+            if (n &lt;= 0) {
+                // Guard page or read error — zero-fill
+                memset(buf, 0, chunk);
+                fwrite(buf, chunk, 1, core);
+            } else {
+                fwrite(buf, n, 1, core);
+                if ((size_t)n &lt; chunk) {
+                    // Short read — pad the remainder
+                    size_t shortfall = chunk - n;
+                    memset(buf, 0, shortfall);
+                    fwrite(buf, shortfall, 1, core);
+                }
+            }
+
+            addr += chunk;
+            rem  -= chunk;
+        }
+    }</code></pre><p>Three cases handled:</p>
+<ol>
+<li><strong>Full read</strong> (<code>n == chunk</code>): write the data directly</li>
+<li><strong>Short read</strong> (<code>0 &lt; n &lt; chunk</code>): write what we got + zero-pad the rest</li>
+<li><strong>Failed read</strong> (<code>n &lt;= 0</code>): zero-fill the entire page</li>
+</ol>
+<p>The short read case is important — it can happen at the boundary of mapped memory. Without handling it, we&#39;d write fewer bytes than the PT_LOAD header promises, and GDB would misalign every subsequent region.</p>
+<h2>Dump Levels: Standard vs Full</h2>
+<p>Here&#39;s where practical engineering meets the ELF spec. A typical cvmfs2 process has hundreds of memory regions — libc, libpthread, libcurl, libssl, the FUSE libraries, and dozens more. Dumping every byte produces a core file that can be 500MB or more.</p>
+<p>But GDB doesn&#39;t actually <em>need</em> most of that data. It can reload shared library <code>.text</code> sections from the original files on disk, as long as NT_FILE tells it where to find them.</p>
+<h3>Standard Mode (Default)</h3>
+<pre><code class="language-c">case DUMP_STANDARD:
+    // Always keep the dynamic linker
+    if (strstr(r-&gt;name, "/ld-linux") ||
+        strstr(r-&gt;name, "/ld-musl")  ||
+        strstr(r-&gt;name, "/ld.so"))
+        return 1;
+
+    // Always keep the main executable
+    if (g_exe_path[0] &amp;&amp; strcmp(r-&gt;name, g_exe_path) == 0)
+        return 1;
+
+    // Skip read-only file-backed regions of shared libraries
+    if (r-&gt;name[0] == '/' &amp;&amp; !r-&gt;writable)
+        return 0;
+
+    // Keep everything else
+    return 1;</code></pre><p>What gets skipped:</p>
+<ul>
+<li>Read-only <code>.text</code> and <code>.rodata</code> segments of shared libraries (libc, libcurl, etc.)</li>
+<li>These are often 100-300MB combined</li>
+</ul>
+<p>What gets kept:</p>
+<ul>
+<li><strong>The main executable</strong> — always, because GDB reads symbols from it</li>
+<li><strong>The dynamic linker</strong> (<code>ld-linux.so</code>) — always, because GDB needs its <code>r_debug</code> structure to discover all loaded libraries</li>
+<li><strong>Writable regions</strong> (<code>.data</code>, <code>.bss</code>, heap, stack) — where the actual runtime state lives</li>
+<li><strong>Anonymous mappings</strong> — thread stacks, mmap&#39;d buffers</li>
+<li><strong><code>[vdso]</code></strong> — the virtual dynamic shared object</li>
+</ul>
+<div class="mermaid">flowchart TD
+    A["Memory Region"] --> B{"Readable?"}
+    B -->|No| Z["SKIP"]
+    B -->|Yes| C{"Kernel region?\n[vvar] [vsyscall]"}
+    C -->|Yes| Z
+    C -->|No| D{"Standard mode?"}
+    D -->|"Full mode"| Y["DUMP ✓"]
+    D -->|"Standard"| E{"Dynamic linker?\n/ld-linux*"}
+    E -->|Yes| Y
+    E -->|No| F{"Main executable?"}
+    F -->|Yes| Y
+    F -->|No| G{"File-backed\n& read-only?"}
+    G -->|Yes| Z
+    G -->|No| Y
+
+    style Y fill:#cfc,stroke:#393
+    style Z fill:#fcc,stroke:#c33</div><h3>The Size Difference</h3>
+<p>For a typical cvmfs2 process with 30 loaded shared libraries:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Core Size</th>
+<th>Backtrace Quality</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Standard</strong></td>
+<td>~15-30 MB</td>
+<td>Full backtraces (GDB reloads .text from disk)</td>
+</tr>
+<tr>
+<td><strong>Full</strong></td>
+<td>~300-500 MB</td>
+<td>Full backtraces + hex dump of all memory</td>
+</tr>
+</tbody></table>
+<p>Standard mode is the default because 95% of the time, you just want the backtrace. The writable memory (stack, heap, globals) is where all the interesting runtime state lives anyway.</p>
+<h3>Why Keep the Dynamic Linker?</h3>
+<p>This is a subtle but critical detail. GDB discovers loaded shared libraries by reading a chain of data structures that starts in the dynamic linker&#39;s memory:</p>
+<pre><code class="language-">ld-linux.so → _DYNAMIC → DT_DEBUG → r_debug → link_map chain
+                                      ↓
+                          lib1.so → lib2.so → lib3.so → ...</code></pre><p>If we skip <code>ld-linux.so</code>&#39;s writable region, GDB can&#39;t find this chain, and it won&#39;t know about <em>any</em> shared libraries. The entire <code>info sharedlibrary</code> output would be empty, and symbol resolution would fail for everything except the main executable.</p>
+<p>So even in standard mode, <code>ld-linux.so</code> is always fully dumped.</p>
+<h2>The Summary — What the User Sees</h2>
+<p>After writing everything, the tool exits silently on success. Here&#39;s what a real run looks like — two tests from the actual vagrant session:</p>
+<p><strong>Test 1: cvmfs2 daemon (complex, 14 threads)</strong></p>
+<pre><code class="language-bash">[vagrant@arch D-state-debugger]$ ps aux | grep cvmfs2
+cvmfs  1323  1.3  0.6 657440 50648 ?   Sl   17:36   0:00 /usr/bin/cvmfs2 -o rw,system_mount,... alice.cern.ch /cvmfs/alice.cern.ch
+
+[vagrant@arch D-state-debugger]$ sudo ./Dcoredumper 1323 /tmp/cvmfs.core
+Memory regions: 511
+Threads:        14
+  TID 1323    RIP=0x00007ff49c29fff2  RSP=0x00007ffdfb8be668  RBP recovered: 0x00007ffdfb8be690 (chain depth: 8)
+  TID 1324    RIP=0x00007ff49c29fff2  RSP=0x00007ff498ffed38  RBP recovered: 0x00007ff498ffed60 (chain depth: 5)
+  TID 1325    RIP=0x00007ff49c29fff2  RSP=0x00007ff4987fdc58  RBP recovered: 0x00007ff4987fdca0 (chain depth: 4)
+  ...
+  TID 1346    RIP=0x00007ff49c29405e  RSP=0x00007ff48dff8b80  RBP recovered: 0x00007ff48dff8bb0 (chain depth: 13)
+
+Core dump successfully saved to /tmp/cvmfs.core</code></pre>
+<p><strong>Test 2: tree (simple, 1 thread, clearly D-state)</strong></p>
+<pre><code class="language-bash">[vagrant@arch D-state-debugger]$ ps aux | grep D
+vagrant  1344  0.0  0.0  5980  4228 pts/1  D+  17:36  0:00 tree /cvmfs/alice.cern.ch
+
+[vagrant@arch D-state-debugger]$ sudo ./Dcoredumper 1344 /tmp/tree.core
+Memory regions: 27
+Threads:        1
+  TID 1344    RIP=0x00007f808830a95e  RSP=0x00007ffd67909e58  RBP recovered: 0x00007ffd6790a080 (chain depth: 8)
+
+Core dump successfully saved to /tmp/tree.core</code></pre>
+
+<h2>Loading It in GDB — The Moment of Truth</h2>
+<p>Here's the full real GDB session from the vagrant test. First the simple case — <code>tree</code> — which gives a clean, readable backtrace:</p>
+<pre><code class="language-bash">[vagrant@arch D-state-debugger]$ gdb /usr/bin/tree /tmp/tree.core
+Reading symbols from /usr/bin/tree...
+Reading symbols from /home/vagrant/.cache/debuginfod_client/.../debuginfo...
+Core was generated by `/usr/bin/tree /cvmfs/alice.cern.ch&#39;.
+[Thread debugging using libthread_db enabled]
+[New LWP 1344]
+#0  __GI___fstatat64 (fd=-100,
+    file=0x55d743d505a0 "/cvmfs/alice.cern.ch/containers/fs/singularity/compat_el9-x86_64",
+    buf=0x7ffd67909f20, flag=0)
+    at ../sysdeps/unix/sysv/linux/fstatat64.c:159
+
+(gdb) thread apply all bt
+
+Thread 1 (Thread 0x7f8088484740 (LWP 1344)):
+#0  __GI___fstatat64 (fd=-100,
+    file=0x55d743d505a0 "/cvmfs/alice.cern.ch/containers/fs/singularity/compat_el9-x86_64",
+    buf=0x7ffd67909f20, flag=0)
+    at ../sysdeps/unix/sysv/linux/fstatat64.c:159
+#1  0x000055d718d30d98 in getinfo (name=0x0, path=0x0)
+    at /usr/src/debug/tree/unix-tree-2.3.2/tree.c:860
+#2  0x000055d718d344eb in listdir (dirname=..., lev=3, dev=51)
+    at /usr/src/debug/tree/unix-tree-2.3.2/list.c:242
+#3  0x000055d718d34133 in listdir (dirname=..., lev=2, dev=51)
+    at /usr/src/debug/tree/unix-tree-2.3.2/list.c:264
+#4  0x000055d718d34133 in listdir (dirname=..., lev=1, dev=51)
+    at /usr/src/debug/tree/unix-tree-2.3.2/list.c:264
+#5  0x000055d718d349f2 in emit_tree (dirname=...)
+    at /usr/src/debug/tree/unix-tree-2.3.2/list.c:114
+#6  0x000055d718d29649 in main (argc=..., argv=...)
+    at /usr/src/debug/tree/unix-tree-2.3.2/tree.c:624</code></pre>
+<p>There it is. The <code>tree</code> process is stuck in <code>fstatat64</code> trying to stat a path inside <code>/cvmfs/alice.cern.ch/containers/fs/singularity/</code>. A CVMFS FUSE lookup that never returned — exactly what we expected.</p>
+<p>Now the full cvmfs2 daemon backtrace — 14 threads, the key one is Thread 14:</p>
+<pre><code class="language-bash">[vagrant@arch D-state-debugger]$ gdb /usr/bin/cvmfs2 /tmp/cvmfs.core
+Reading symbols from /usr/bin/cvmfs2...
+Reading symbols from /usr/lib/debug/usr/bin/cvmfs2.debug...
+[New LWP 1323]
+...
+[New LWP 1346]
+Core was generated by `/usr/bin/cvmfs2 -o rw,system_mount,...&#39;.
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+[Current thread is 1 (Thread 0x7ff49c97b780 (LWP 1323))]
+
+(gdb) thread apply all bt
+
+Thread 14 (Thread 0x7ff48dffb6c0 (LWP 1346)):
+#0  __internal_syscall_cancel (...) at cancellation.c:44
+#1  __pthread_cond_wait_common (cond=..., mutex=...) at pthread_cond_wait.c:421
+#2  ___pthread_cond_wait (...) at pthread_cond_wait.c:453
+#3  Tube&lt;download::DataTubeElement&gt;::PopFront (this=0x7ff47811faa0)
+    at .../cvmfs/util/tube.h:125
+#4  download::DownloadManager::Fetch (this=..., info=...)
+    at .../cvmfs/network/download.cc:2045
+#5  cvmfs::Fetcher::Fetch (this=..., object=..., alt_url=...)
+    at .../cvmfs/fetch.cc:177
+#6  catalog::ClientCatalogManager::StageNestedCatalogByHash (...)
+    at .../cvmfs/catalog_mgr_client.cc:379
+#7  catalog::AbstractCatalogManager::StageNestedCatalogAndUnlock (...)
+    at .../cvmfs/catalog_mgr_impl.h:865
+#8  catalog::AbstractCatalogManager::LookupPath (...)
+    at .../cvmfs/catalog_mgr_impl.h:287
+#9  cvmfs::GetDirentForPath (path=...) at .../cvmfs/cvmfs.cc:428
+#10 cvmfs::cvmfs_lookup (req=..., parent=55380, name=0x... "alma9-alice-20260427_2")
+    at .../cvmfs/cvmfs.cc:580
+#11 loader::stub_lookup (...) at .../cvmfs/loader.cc:217
+#12 ?? () from /usr/lib/libfuse3.so.4
+...
+
+Thread 1 (Thread 0x7ff49c97b780 (LWP 1323)):
+#0  __syscall_cancel_arch () at syscall_cancel.S:56
+...
+#7  fuse_session_loop_mt_312 () from /usr/lib/libfuse3.so.4
+#8  FuseMain (argc=..., argv=...) at .../cvmfs/loader.cc:1220
+#9  main (argc=5, argv=...) at .../cvmfs/fuse_main.cc:145</code></pre>
+<p>The exact call chain: FUSE lookup → catalog manager → download manager → blocking <code>PopFront()</code> on a tube waiting for a download that never completes. The process is stuck waiting on <code>alma9-alice-20260427_2</code> — a nested catalog fetch that stalled.</p>
+<p>The <code>&quot;Core was generated by...&quot;</code> line comes from our NT_PRPSINFO. The thread list comes from per-thread NT_PRSTATUS notes. The function names come from GDB reading the original binary referenced by our NT_FILE note. Everything from Parts 1–3 comes together in this output.</p>
+
+<h2>Error Handling Philosophy</h2>
+<p>One design decision worth calling out: the tool is <strong>aggressively fault-tolerant</strong>. We never abort on partial failures:</p>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Response</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Can&#39;t read a thread&#39;s registers</td>
+<td>Include thread with zeroed registers + print warning</td>
+</tr>
+<tr>
+<td>Thread is running (not in syscall)</td>
+<td>Include thread + note &quot;registers unavailable&quot;</td>
+</tr>
+<tr>
+<td>RBP recovery finds nothing</td>
+<td>Leave RBP as 0 (GDB falls back to DWARF unwinding)</td>
+</tr>
+<tr>
+<td>Memory page read fails</td>
+<td>Zero-fill the page and continue</td>
+</tr>
+<tr>
+<td>Short memory read</td>
+<td>Pad with zeros to maintain offsets</td>
+</tr>
+<tr>
+<td>Can&#39;t read auxv</td>
+<td>Skip NT_AUXV (GDB works without it, just less accurately)</td>
+</tr>
+</tbody></table>
+<p>The philosophy is: <strong>a partial core dump is infinitely better than no core dump</strong>. When you&#39;re staring at a frozen production node that needs a reboot, you want whatever diagnostic data you can get, even if some threads have incomplete register state.</p>
+<p>In Part 5, we&#39;ll zoom out from the code and tell the full CVMFS story — the actual bug this tool was built to diagnose, what the backtraces revealed, and how the tool integrates into the CVMFS ecosystem.</p>
+<p><strong>Final Implementation PR:</strong> <a href="https://github.com/cvmfs/cvmfs/pull/4314">cvmfs/cvmfs#4314</a></p>
+
+
+    <div class="article-nav"><a href="part3.html"><span class="dir">← Previous</span><span class="title">Part 3: Filling the Structs</span></a><div></div></div>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container"><p>GSoC 2026 · CernVM-FS · CERN-HSF</p></div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'dark' });</script>
+
+</body>
+</html>

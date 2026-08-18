@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Part II: The ELF Core Dump — A Dead Process's Autobiography</title>
+  <meta name="description" content="&quot;A core dump is just a save-game file for a crashed process.&quot;">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="index.html" class="logo"><span>dcoredumper</span></a>
+    <nav class="site-nav">
+      <a href="part1.html">I</a>
+      <a href="part2.html" class="active">II</a>
+      <a href="part3.html">III</a>
+      <a href="part4.html">IV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="article">
+  <div class="container">
+
+    <div class="article-meta">
+      <div class="part-label">Part II</div>
+      <h1>The ELF Core Dump — A Dead Process's Autobiography</h1>
+      <p class="article-subtitle">"A core dump is just a save-game file for a crashed process."</p>
+    </div>
+
+    <p>In Part 1, we learned that D-state processes are untouchable by debuggers because <code>ptrace</code> can&#39;t deliver signals to them. But we discovered a backdoor: <code>/proc/&lt;pid&gt;/</code> still works, giving us access to memory maps, registers, and raw memory.</p>
+<p>Now we need to take that raw data and package it into something GDB understands. That something is an <strong>ELF core dump</strong>.</p>
+<p>If you&#39;ve ever seen a <code>core</code> file after a segfault, you&#39;ve seen one. But what&#39;s actually inside it? And which parts does GDB <em>really</em> need to produce a backtrace? Let&#39;s find out — byte by byte.</p>
+<h2>What Is a Core Dump, Really?</h2>
+<p>A core dump is an <strong>ELF file</strong> — the exact same binary format used for executables (<code>/usr/bin/ls</code>) and shared libraries (<code>libc.so</code>). The only difference is a single field in the header that says &quot;I&#39;m not a program you can run — I&#39;m a snapshot of a program that was running.&quot;</p>
+<p>It contains three things:</p>
+<ol>
+<li><strong>CPU registers</strong> — what each thread was doing at the moment of capture</li>
+<li><strong>Memory contents</strong> — stack, heap, loaded libraries, everything</li>
+<li><strong>Metadata</strong> — process ID, command line, file mappings, auxiliary info</li>
+</ol>
+<p>Think of it as a crime scene photograph. The process is frozen in time, and GDB is the detective examining the evidence.</p>
+<h2>The Big Picture</h2>
+<p>Here&#39;s what an ELF core dump looks like at a high level:</p>
+<p><img src="images/elf_core_layout.png" alt="" loading="lazy">
+<p class="img-caption"></p></p>
+<p>Let&#39;s walk through each section.</p>
+<h2>The ELF Header — &quot;Hello, I&#39;m a Core Dump&quot;</h2>
+<p>Every ELF file starts with a 64-byte header. It&#39;s the file&#39;s ID card:</p>
+<pre><code class="language-c">Elf64_Ehdr ehdr;
+
+// Magic bytes: 0x7f 'E' 'L' 'F' — identifies this as an ELF file
+memcpy(ehdr.e_ident, ELFMAG, SELFMAG);
+
+ehdr.e_ident[EI_CLASS]   = ELFCLASS64;      // 64-bit
+ehdr.e_ident[EI_DATA]    = ELFDATA2LSB;      // Little-endian
+ehdr.e_ident[EI_OSABI]   = ELFOSABI_LINUX;   // Linux
+
+ehdr.e_type    = ET_CORE;    // ← THIS is what makes it a core dump
+ehdr.e_machine = EM_X86_64;  // Architecture
+ehdr.e_phoff   = 64;         // Program headers start right after this header
+ehdr.e_phnum   = 1 + N;      // 1 PT_NOTE + N PT_LOAD segments</code></pre><p>The critical field is <code>e_type = ET_CORE</code>. When GDB opens a file and sees this, it knows: &quot;This isn&#39;t a binary to execute — this is a memory snapshot to analyze.&quot;</p>
+<p>The <code>e_phnum</code> field tells GDB how many <strong>program headers</strong> follow. Each program header describes one chunk of the file — either metadata (notes) or memory content (loadable segments).</p>
+<div class="mermaid">flowchart TB
+    A["ELF Header<br/>(64 bytes)"] --> B["e_type = ET_CORE"]
+    A --> C["e_machine = EM_X86_64"]
+    A --> D["e_phoff = 64<br/>(program headers start here)"]
+    A --> E["e_phnum = 1 + N"]
+    E --> F["1 × PT_NOTE<br/>(all metadata)"]
+    E --> G["N × PT_LOAD<br/>(memory regions)"]</div><h2>Program Headers — The Table of Contents</h2>
+<p>Right after the ELF header comes the <strong>program header table</strong>. Each entry is a 56-byte <code>Elf64_Phdr</code> struct that says: &quot;At file offset X, you&#39;ll find Y bytes of data that belonged at virtual address Z.&quot;</p>
+<p>There are two types we care about:</p>
+<h3>PT_NOTE — &quot;Here&#39;s the metadata&quot;</h3>
+<p>The first program header points to the <strong>note segment</strong> — a blob containing all the structured metadata about the process:</p>
+<pre><code class="language-c">Elf64_Phdr note_phdr;
+note_phdr.p_type   = PT_NOTE;
+note_phdr.p_offset = note_offset;  // where in the file the notes start
+note_phdr.p_filesz = all_notes_sz; // total size of all notes combined</code></pre><h3>PT_LOAD — &quot;Here&#39;s a chunk of memory&quot;</h3>
+<p>Every other program header is a <code>PT_LOAD</code> that maps a memory region:</p>
+<pre><code class="language-c">Elf64_Phdr load_phdr;
+load_phdr.p_type   = PT_LOAD;
+load_phdr.p_offset = file_offset;  // where in the core file
+load_phdr.p_vaddr  = 0x7f4a...;   // original virtual address
+load_phdr.p_filesz = region_size;  // how many bytes
+load_phdr.p_flags  = PF_R | PF_W; // permissions: readable + writable
+load_phdr.p_align  = 4096;        // page-aligned</code></pre><p>When GDB wants to examine memory at address <code>0x7f4a1234</code>, it scans the PT_LOAD headers to find which one contains that address, then seeks to the corresponding file offset and reads the bytes. Simple lookup table.</p>
+<h2>The NOTE Segment — The Metadata Gold Mine</h2>
+<p>This is where the interesting stuff lives. The note segment is a sequence of <strong>ELF notes</strong>, each wrapped in a tiny header:</p>
+<pre><code class="language-c">typedef struct {
+    uint32_t n_namesz;  // Length of the name (always 5: "CORE\0")
+    uint32_t n_descsz;  // Length of the descriptor (the actual data)
+    uint32_t n_type;    // Note type (NT_PRSTATUS, NT_PRPSINFO, etc.)
+} Elf64_Nhdr;
+// Followed by: padded name + padded descriptor</code></pre><p>Every note follows the same pattern: <strong>12-byte header → &quot;CORE\0&quot; name (padded to 8 bytes) → descriptor data (padded to 4-byte boundary)</strong>.</p>
+<p>There are four note types that matter:</p>
+<h3>NT_PRSTATUS — Thread Status</h3>
+<p><strong>One per thread. 336 bytes each. This is what GDB needs most.</strong></p>
+<p>NT_PRSTATUS contains the CPU register state for a single thread. Without this, GDB literally cannot produce a backtrace.</p>
+<p><img src="images/nt_prstatus_layout.png" alt="" loading="lazy">
+<p class="img-caption"></p></p>
+<p>Here&#39;s the layout:</p>
+<table>
+<thead>
+<tr>
+<th>Byte Range</th>
+<th>Field</th>
+<th>What It Contains</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0–15</td>
+<td>Signal info</td>
+<td>What signal stopped/killed the thread</td>
+</tr>
+<tr>
+<td>32–35</td>
+<td><code>pr_pid</code></td>
+<td>Thread ID (TID)</td>
+</tr>
+<tr>
+<td>48–111</td>
+<td>CPU timers</td>
+<td><code>utime</code>, <code>stime</code>, <code>cutime</code>, <code>cstime</code></td>
+</tr>
+<tr>
+<td><strong>112–327</strong></td>
+<td><strong>GP Registers</strong></td>
+<td><strong>27 × 8-byte registers — the crown jewels</strong></td>
+</tr>
+<tr>
+<td>328–335</td>
+<td><code>fpvalid</code></td>
+<td>Whether floating-point state follows</td>
+</tr>
+</tbody></table>
+<p>The register block at offset 112 is the entire x86_64 <code>user_regs_struct</code> — 27 general-purpose registers in the exact order the kernel stores them:</p>
+<pre><code class="language-c">// The 27 x86_64 registers in user_regs_struct order:
+// Index  Register   Role
+//  0     R15        General purpose
+//  1     R14        General purpose
+//  2     R13        General purpose
+//  3     R12        General purpose
+//  4     RBP        Frame pointer ← critical for stack walking
+//  ...
+// 10     RAX        Return value / syscall number
+// 12     RDX        3rd argument
+// 13     RSI        2nd argument
+// 14     RDI        1st argument
+// 15     ORIG_RAX   Original syscall number
+// 16     RIP        Instruction pointer ← where the thread is executing
+// 17     CS         Code segment selector (0x33 for userspace)
+// 18     EFLAGS     Processor flags
+// 19     RSP        Stack pointer ← top of the thread's stack
+// 20     SS         Stack segment selector (0x2b for userspace)</code></pre><p>GDB uses <strong>RIP</strong> to know which instruction the thread was on, <strong>RSP</strong> to find the top of the stack, and <strong>RBP</strong> to walk the frame pointer chain and reconstruct the full call stack.</p>
+<p>In our code, filling this struct looks like:</p>
+<pre><code class="language-c">unsigned char *prstatus = calloc(1, 336);  // zero-initialized
+
+// Set the thread ID
+*(pid_t *)(prstatus + 32) = thread.tid;
+
+// Copy all 27 registers into the register block at offset 112
+memcpy(prstatus + 112, thread.regs, 27 * sizeof(unsigned long));
+
+// Write as an ELF note
+write_note(core_file, NT_PRSTATUS, prstatus, 336);</code></pre><p><strong>Why one per thread?</strong> Because each thread has its own register state and its own call stack. In a multi-threaded program like cvmfs2, the daemon might have 30+ threads, and only some are stuck in D-state. The per-thread NT_PRSTATUS lets GDB show you: &quot;Thread 1 is stuck in <code>SafeRead()</code>, Thread 2 is stuck in <code>Signal::Wait()</code>, Thread 3 is idle in <code>poll()</code>...&quot;</p>
+<h3>NT_PRPSINFO — Process Identity (One Per Process)</h3>
+<p><strong>136 bytes. Written once. Tells GDB what program this core came from.</strong></p>
+<pre><code class="language-c">unsigned char *prpsinfo = calloc(1, 136);
+
+prpsinfo[0] = 2;    // pr_state = TASK_UNINTERRUPTIBLE (D-state!)
+prpsinfo[1] = 'D';  // pr_sname = 'D'
+
+// Thread/process ID
+*(pid_t *)(prpsinfo + 24) = pid;
+
+// Program name (what shows up in GDB's "Core was generated by...")
+strncpy((char *)(prpsinfo + 40), "cvmfs2", 16);     // pr_fname
+
+// Full command line
+strncpy((char *)(prpsinfo + 56), "/usr/bin/cvmfs2 /cvmfs/atlas.cern.ch ...", 80);
+
+write_note(core_file, NT_PRPSINFO, prpsinfo, 136);</code></pre><p>When you open the core in GDB, the first thing it prints is:</p>
+<pre><code class="language-">Core was generated by `/usr/bin/cvmfs2 /cvmfs/atlas.cern.ch fuse...'.</code></pre><p>That comes from <code>pr_psargs</code> at offset 56. And the <code>pr_state = &#39;D&#39;</code> is our little calling card — it tells anyone examining this core that the process was in uninterruptible sleep when we captured it.</p>
+<h3>NT_FILE — The Library Map</h3>
+<p><strong>Variable size. Written once. This is how GDB finds function names.</strong></p>
+<p>Here&#39;s something that trips people up: the core dump doesn&#39;t contain the <code>.text</code> (code) section of shared libraries. It <em>can</em>, but for a standard-mode dump, we skip those read-only regions to save space. So how does GDB know that address <code>0x7f4a12345678</code> is inside <code>libc.so</code> at function <code>read()</code>?</p>
+<p><strong>NT_FILE.</strong></p>
+<p>This note contains a mapping of virtual address ranges to filenames:</p>
+<pre><code class="language-">Address Range                    File Offset    Filename
+0x7f4a12340000–0x7f4a12380000    0x0            /usr/lib64/libc.so.6
+0x7f4a12380000–0x7f4a12390000    0x40000        /usr/lib64/libc.so.6
+0x55a8b1000000–0x55a8b1020000    0x0            /usr/bin/cvmfs2
+...</code></pre><p>When GDB sees that address <code>0x7f4a12345678</code> falls in the range for <code>/usr/lib64/libc.so.6</code>, it opens that file from disk, reads the symbol table and DWARF debug info, and resolves the address to a function name + line number.</p>
+<p>This is why <strong>we always include all file-backed regions in NT_FILE</strong>, even in standard dump mode where we skip dumping their actual memory contents. The memory can be reloaded from disk; the address mapping cannot.</p>
+<pre><code class="language-c">// NT_FILE format:
+//   uint64_t count        — number of file entries
+//   uint64_t page_size    — 4096
+//   count × { uint64_t start, end, file_offset }
+//   count × null-terminated filename strings</code></pre><div class="mermaid">flowchart LR
+    A["NT_FILE entry:<br/>0x7f4a1234...–0x7f4a1238...<br/>/usr/lib64/libc.so.6"] --> B["GDB opens<br/>/usr/lib64/libc.so.6<br/>from disk"]
+    B --> C["Reads .symtab<br/>and .eh_frame"]
+    C --> D["Resolves:<br/>0x7f4a12345678<br/>= read+0x42"]</div><blockquote>
+<p><strong>Key insight:</strong> NT_FILE is what makes standard dump mode work. We skip dumping 200MB of read-only <code>.text</code> pages from shared libraries, but GDB can still resolve every symbol because NT_FILE tells it where to find the files on disk.</p>
+</blockquote>
+<h3>NT_AUXV — The Kernel&#39;s Cheat Sheet</h3>
+<p><strong>Variable size. Written once. Contains the auxiliary vector.</strong></p>
+<p>The auxiliary vector (<code>auxv</code>) is a block of key-value pairs that the kernel passes to every process at startup. It contains system-level information like:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Value</th>
+<th>GDB Uses It For</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>AT_ENTRY</code></td>
+<td>Program entry point</td>
+<td>Finding <code>_start</code></td>
+</tr>
+<tr>
+<td><code>AT_PHDR</code></td>
+<td>Address of program headers in memory</td>
+<td>Locating the dynamic linker</td>
+</tr>
+<tr>
+<td><code>AT_PAGESZ</code></td>
+<td>System page size (4096)</td>
+<td>Memory alignment</td>
+</tr>
+<tr>
+<td><code>AT_SYSINFO_EHDR</code></td>
+<td>vDSO address</td>
+<td>System call optimization info</td>
+</tr>
+</tbody></table>
+<p>We don&#39;t need to parse this — we just read the raw bytes from <code>/proc/&lt;pid&gt;/auxv</code> and embed them as-is:</p>
+<pre><code class="language-c">char *auxv_data;
+size_t auxv_size;
+read_auxv(pid, &amp;auxv_data, &amp;auxv_size);  // reads /proc/pid/auxv
+
+write_note(core_file, NT_AUXV, auxv_data, auxv_size);</code></pre><p>GDB uses this primarily to find the <strong>dynamic linker</strong> (<code>ld-linux.so</code>), which in turn tells it where all the shared libraries are loaded. Combined with NT_FILE, this gives GDB a complete picture of the process&#39;s address space layout.</p>
+<h2>The LOAD Segments — The Actual Memory</h2>
+<p>After the note segment comes the bulk of the core file: the actual memory contents.</p>
+<p>Each <code>PT_LOAD</code> program header we wrote earlier corresponds to one memory region. Now we write the raw bytes for each region, in the same order:</p>
+<pre><code class="language-c">for (int i = 0; i &lt; num_regions; i++) {
+    if (!should_dump_region(&amp;regions[i])) continue;
+
+    size_t region_size = regions[i].end - regions[i].start;
+
+    // Read the region page-by-page from /proc/pid/mem
+    for (size_t offset = 0; offset &lt; region_size; offset += PAGE_SIZE) {
+        unsigned char page[4096];
+        ssize_t n = pread(mem_fd, page, PAGE_SIZE,
+                          regions[i].start + offset);
+
+        if (n &lt;= 0) {
+            // Guard page or unmapped — write zeros instead of aborting
+            memset(page, 0, PAGE_SIZE);
+            n = PAGE_SIZE;
+        }
+
+        fwrite(page, n, 1, core_file);
+    }
+}</code></pre><p>Two important details:</p>
+<ol>
+<li><p><strong>Page-by-page reads</strong>: We don&#39;t try to read an entire 8MB stack region in one <code>pread()</code> call. Some pages within a region might be guard pages (deliberately unmapped to catch stack overflows). Reading them returns <code>EIO</code>. By reading one page at a time, we isolate failures and zero-fill just the bad pages.</p>
+</li>
+<li><p><strong>Zero-filling</strong>: If a page read fails, we write 4096 zero bytes instead. This keeps the file offsets consistent — every PT_LOAD header says &quot;region X is at file offset Y with size Z,&quot; and those offsets must be exact. Skipping bytes would corrupt the entire file.</p>
+</li>
+</ol>
+<h2>The Offset Arithmetic — Getting It Right</h2>
+<p>The trickiest part of writing a core dump isn&#39;t any individual piece — it&#39;s making all the offsets consistent. Every program header contains file offsets that must point to exactly the right byte in the output file.</p>
+<p>Here&#39;s the calculation:</p>
+<pre><code class="language-">File offset 0:          ELF header (64 bytes)
+File offset 64:         Program header table
+                        = (1 + loadable_regions) × 56 bytes
+File offset X:          NOTE segment starts
+                        = 64 + phdr_table_size
+File offset Y:          First LOAD segment starts
+                        = X + total_notes_size
+File offset Y+size[0]:  Second LOAD segment starts
+...</code></pre><div class="mermaid">flowchart TB
+    A["1. Count dumpable regions → N"] --> B["2. Calculate note sizes"]
+    B --> C["3. note_offset = 64 + (1+N) × 56"]
+    C --> D["4. data_offset = note_offset + all_notes_size"]
+    D --> E["5. Write ELF header"]
+    E --> F["6. Write PT_NOTE phdr (offset = note_offset)"]
+    F --> G["7. Write N × PT_LOAD phdrs<br/>(each offset = running total)"]
+    G --> H["8. Write notes at note_offset"]
+    H --> I["9. Write memory at data_offset"]
+
+    style A fill:#e8f4fd
+    style I fill:#e8f4fd</div><p>Everything must be calculated <strong>before</strong> writing anything, because the ELF header and program headers reference offsets that come later in the file. This is why <code>build_core()</code> does a two-pass approach:</p>
+<ol>
+<li><strong>First pass</strong>: count regions, calculate sizes, compute all offsets</li>
+<li><strong>Second pass</strong>: write everything in order</li>
+</ol>
+<h2>Putting It All Together</h2>
+<p>Let&#39;s zoom out. Here&#39;s the complete pipeline from a D-state process to a GDB backtrace:</p>
+<div class="mermaid">flowchart LR
+    A["/proc/pid/maps"] -->|parse| B["Memory regions"]
+    C["/proc/pid/task/*/syscall"] -->|parse| D["Thread registers"]
+    E["/proc/pid/auxv"] -->|read| F["Auxiliary vector"]
+    G["/proc/pid/mem"] -->|pread| H["Raw memory"]
+
+    B --> I["build_core()"]
+    D --> I
+    F --> I
+    H --> I
+
+    I -->|write| J["output.core"]
+    J -->|load| K["GDB"]
+    K --> L["thread apply all bt"]</div><p>The core file is just a container format — a way to organize <code>/proc</code> data into something GDB already knows how to read. We&#39;re not inventing anything new; we&#39;re just filling in the same structs that the kernel would normally fill if it could dump core the normal way.</p>
+<p>In Part 3, we&#39;ll dive into the trickiest part: how we actually extract the data from <code>/proc</code>, especially the heuristic RBP recovery that turns a one-frame backtrace into a full call stack.</p>
+
+
+    <div class="article-nav"><a href="part1.html"><span class="dir">← Previous</span><span class="title">Part 1: How Debuggers Work</span></a><a href="part3.html" class="next"><span class="dir">Next →</span><span class="title">Part 3: Filling the Structs</span></a></div>
+
+  </div>
+</main>
+
+<footer class="site-footer">
+  <div class="container"><p>GSoC 2026 · CernVM-FS · CERN-HSF</p></div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'dark' });</script>
+
+</body>
+</html>
